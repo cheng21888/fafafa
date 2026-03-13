@@ -1,8 +1,7 @@
-Flask>=2.2.0
+streamlit
 baostock>=0.8.8
 akshare>=1.17.8
 pandas>=2.2.0
 numpy>=1.24.0
 schedule
 tqdm
-python-dotenv
