@@ -52,49 +52,25 @@ st.markdown("""
     .stock-search {
         background-color: #f0f2f6;
         border-radius: 5px;
-        padding: 0.5rem;
+        padding: 1rem;
         margin-bottom: 1rem;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# 缓存股票列表数据
-@st.cache_data(ttl=3600)  # 缓存1小时
-def get_stock_list():
-    """获取A股股票列表"""
+def get_stock_name(stock_code):
+    """根据股票代码获取股票名称"""
     try:
-        # 获取A股股票列表
-        stock_info_df = ak.stock_info_a_code_name()
-        return stock_info_df
-    except Exception as e:
-        st.error(f"获取股票列表失败: {e}")
-        # 返回默认股票列表作为备选
-        default_stocks = pd.DataFrame({
-            'code': ['000001', '600000', '300015', '600519', '002594', '300750'],
-            'name': ['平安银行', '浦发银行', '爱尔眼科', '贵州茅台', '比亚迪', '宁德时代']
-        })
-        return default_stocks
-
-def search_stocks(search_term, stock_list):
-    """搜索股票"""
-    if not search_term:
-        return stock_list.head(10)  # 返回前10个作为推荐
-    
-    # 搜索股票代码或名称
-    mask = (
-        stock_list['code'].str.contains(search_term, na=False) |
-        stock_list['name'].str.contains(search_term, na=False)
-    )
-    return stock_list[mask].head(10)  # 限制返回10条结果
-
-def get_stock_info(stock_code, stock_list):
-    """获取股票名称"""
-    try:
-        stock_info = stock_list[stock_list['code'] == stock_code]
-        if not stock_info.empty:
-            return stock_info.iloc[0]['name']
+        # 尝试获取股票信息
+        stock_info = ak.stock_individual_info_em(symbol=stock_code)
+        if stock_info is not None and not stock_info.empty:
+            # 从返回的数据中提取股票名称
+            name_row = stock_info[stock_info['item'] == '股票简称']
+            if not name_row.empty:
+                return name_row['value'].iloc[0]
         return f"股票{stock_code}"
     except:
+        # 如果获取失败，返回代码
         return f"股票{stock_code}"
 
 def get_auction_data_akshare(symbol):
@@ -286,64 +262,34 @@ def plot_auction_chart(auction_df, symbol):
 def main():
     st.markdown('<h1 class="main-header">📈 A股集合竞价分析系统</h1>', unsafe_allow_html=True)
     
-    # 获取股票列表
-    stock_list = get_stock_list()
-    
     # 侧边栏配置
     with st.sidebar:
         st.header("⚙️ 配置选项")
         
         # 股票搜索框
         st.markdown('<div class="stock-search">', unsafe_allow_html=True)
-        st.mark("### 🔍 股票搜索")
+        st.markdown("### 🔍 股票代码")
         
         # 初始化session state
         if 'selected_stock' not in st.session_state:
             st.session_state.selected_stock = '000001'
-        if 'search_term' not in st.session_state:
-            st.session_state.search_term = ''
         
-        # 搜索输入框
-        search_term = st.text_input(
-            "输入股票代码或名称",
-            value=st.session_state.search_term,
-            placeholder="例如: 000001 或 平安银行",
-            key="search_input"
+        # 股票代码输入框
+        stock_code = st.text_input(
+            "输入股票代码",
+            value=st.session_state.selected_stock,
+            placeholder="例如: 000001",
+            key="stock_code_input",
+            max_chars=6
         )
         
-        # 更新搜索词
-        if search_term != st.session_state.search_term:
-            st.session_state.search_term = search_term
-        
-        # 搜索结果显示
-        search_results = search_stocks(search_term, stock_list)
-        
-        if not search_results.empty:
-            # 创建选择选项
-            options = []
-            for _, row in search_results.iterrows():
-                options.append(f"{row['code']} - {row['name']}")
-            
-            # 默认选中000001
-            default_index = 0
-            for i, opt in enumerate(options):
-                if opt.startswith('000001'):
-                    default_index = i
-                    break
-            
-            selected_option = st.selectbox(
-                "选择股票",
-                options=options,
-                index=default_index,
-                key="stock_selector"
-            )
-            
-            # 解析选择的股票代码
-            if selected_option:
-                st.session_state.selected_stock = selected_option.split(' - ')[0]
-        else:
-            st.warning("未找到匹配的股票")
-            st.session_state.selected_stock = '000001'
+        # 更新选择的股票代码
+        if stock_code and stock_code != st.session_state.selected_stock:
+            # 简单验证：6位数字
+            if stock_code.isdigit() and len(stock_code) == 6:
+                st.session_state.selected_stock = stock_code
+            else:
+                st.warning("请输入6位数字股票代码")
         
         st.markdown('</div>', unsafe_allow_html=True)
         
@@ -360,7 +306,15 @@ def main():
     
     # 获取当前选择的股票代码和名称
     selected_stock = st.session_state.selected_stock
-    stock_name = get_stock_info(selected_stock, stock_list)
+    
+    # 验证股票代码
+    if not selected_stock or not (selected_stock.isdigit() and len(selected_stock) == 6):
+        st.warning("请输入有效的6位数字股票代码")
+        st.stop()
+    
+    # 获取股票名称
+    with st.spinner('正在获取股票信息...'):
+        stock_name = get_stock_name(selected_stock)
     
     # 主内容区域
     col1, col2 = st.columns([2, 1])
