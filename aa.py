@@ -3,7 +3,7 @@
 
 """
 CChanTrader-AI 交易日报生成器 - Streamlit版本
-在每个交易日9:25-9:29自动分析并生成日报，使用Streamlit显示
+支持选择日期进行分析
 """
 
 import os
@@ -19,6 +19,7 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
+import time
 
 warnings.filterwarnings('ignore')
 
@@ -81,6 +82,9 @@ st.markdown("""
         color: #d32f2f;
         font-weight: bold;
     }
+    .stDateInput {
+        margin-bottom: 1rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -88,15 +92,20 @@ st.markdown("""
 class DailyReportGenerator:
     """交易日报生成器"""
     
-    def __init__(self):
-        """初始化日报生成器"""
+    def __init__(self, analysis_date=None):
+        """
+        初始化日报生成器
+        Args:
+            analysis_date: 分析日期，datetime对象，默认为当前日期
+        """
         self.analysis_results = {}
         self.report_data = {}
+        self.analysis_date = analysis_date or datetime.now()
         
     def is_trading_day(self, date=None) -> bool:
         """判断是否为交易日"""
         if date is None:
-            date = datetime.now()
+            date = self.analysis_date
         
         # 简化版：排除周末
         weekday = date.weekday()
@@ -105,11 +114,17 @@ class DailyReportGenerator:
         
         return True
     
-    def get_stock_data_quick(self, symbol: str, days: int = 30) -> pd.DataFrame:
-        """快速获取股票数据"""
+    def get_stock_data_for_date(self, symbol: str, target_date: datetime, days: int = 60) -> pd.DataFrame:
+        """
+        获取指定日期附近的股票数据
+        Args:
+            symbol: 股票代码
+            target_date: 目标日期
+            days: 获取数据的天数范围
+        """
         try:
-            end_date = datetime.now().strftime('%Y-%m-%d')
-            start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+            end_date = target_date.strftime('%Y-%m-%d')
+            start_date = (target_date - timedelta(days=days)).strftime('%Y-%m-%d')
             
             rs = bs.query_history_k_data_plus(symbol,
                 'date,code,open,high,low,close,volume',
@@ -127,43 +142,70 @@ class DailyReportGenerator:
                     df[col] = df[col].astype(str).str.split().str[0]
                     df[col] = pd.to_numeric(df[col], errors='coerce')
             
+            # 确保日期列是日期类型并排序
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date')
+            
             return df.dropna()
             
-        except Exception:
+        except Exception as e:
+            st.error(f"获取股票数据失败 {symbol}: {e}")
             return pd.DataFrame()
     
-    def get_auction_data_quick(self, symbol: str) -> dict:
-        """快速获取竞价数据"""
+    def get_auction_data_for_date(self, symbol: str, target_date: datetime) -> dict:
+        """
+        获取指定日期的竞价数据
+        注意：AKShare可能无法获取历史竞价数据，这里使用模拟或备选方案
+        """
         try:
-            # 使用AKShare获取竞价数据
-            pre_market_df = ak.stock_zh_a_hist_pre_min_em(
-                symbol=symbol,
-                start_time="09:00:00",
-                end_time="09:30:00"
-            )
+            # 尝试获取历史竞价数据
+            # 注意：AKShare的盘前数据接口可能不支持历史数据
+            # 这里使用一个模拟方案，实际使用时需要根据数据源调整
             
-            if pre_market_df.empty:
-                return self._get_default_auction()
+            # 方案1：如果是当前日期，尝试获取实时数据
+            if target_date.date() == datetime.now().date():
+                pre_market_df = ak.stock_zh_a_hist_pre_min_em(
+                    symbol=symbol,
+                    start_time="09:00:00",
+                    end_time="09:30:00"
+                )
+                
+                if not pre_market_df.empty:
+                    # 筛选竞价时间
+                    auction_df = pre_market_df[
+                        pre_market_df['时间'].str.contains('09:1[5-9]|09:2[0-5]')
+                    ]
+                    
+                    if not auction_df.empty:
+                        final_price = float(auction_df.iloc[-1]['开盘'])
+                        total_volume = auction_df['成交量'].sum()
+                        
+                        return {
+                            'final_price': final_price,
+                            'total_volume': total_volume,
+                            'data_points': len(auction_df),
+                            'status': 'success'
+                        }
             
-            # 筛选竞价时间
-            auction_df = pre_market_df[
-                pre_market_df['时间'].str.contains('09:1[5-9]|09:2[0-5]')
-            ]
+            # 方案2：使用历史日线数据估算竞价情况
+            historical_data = self.get_stock_data_for_date(symbol, target_date, 5)
+            if not historical_data.empty and len(historical_data) >= 2:
+                # 使用前一日收盘价作为竞价基准
+                prev_close = float(historical_data['close'].iloc[-2]) if len(historical_data) >= 2 else float(historical_data['close'].iloc[-1])
+                current_open = float(historical_data['open'].iloc[-1])
+                
+                # 估算竞价数据
+                return {
+                    'final_price': current_open,
+                    'total_volume': float(historical_data['volume'].iloc[-1]) * 0.1,  # 估算竞价量
+                    'data_points': 10,  # 估算数据点
+                    'status': 'estimated'
+                }
             
-            if auction_df.empty:
-                return self._get_default_auction()
+            return self._get_default_auction()
             
-            final_price = float(auction_df.iloc[-1]['开盘'])
-            total_volume = auction_df['成交量'].sum()
-            
-            return {
-                'final_price': final_price,
-                'total_volume': total_volume,
-                'data_points': len(auction_df),
-                'status': 'success'
-            }
-            
-        except Exception:
+        except Exception as e:
+            st.warning(f"获取竞价数据失败 {symbol}: {e}")
             return self._get_default_auction()
     
     def _get_default_auction(self) -> dict:
@@ -179,22 +221,37 @@ class DailyReportGenerator:
         """分析单只股票"""
         try:
             # 获取历史数据
-            df = self.get_stock_data_quick(symbol, 30)
+            df = self.get_stock_data_for_date(symbol, self.analysis_date, 60)
             if len(df) < 20:
                 return None
             
-            current_price = float(df['close'].iloc[-1])
-            prev_close = float(df['close'].iloc[-2])
+            # 找到目标日期在数据中的位置
+            target_date_str = self.analysis_date.strftime('%Y-%m-%d')
+            if target_date_str in df['date'].astype(str).values:
+                # 目标日期有数据
+                target_idx = df[df['date'].astype(str) == target_date_str].index[0]
+                if target_idx > 0:
+                    current_price = float(df.loc[target_idx, 'close'])
+                    prev_close = float(df.loc[target_idx - 1, 'close'])
+                    analysis_df = df.loc[:target_idx].copy()  # 使用截止到目标日期的数据
+                else:
+                    return None
+            else:
+                # 目标日期无数据，使用最近的数据
+                st.warning(f"目标日期 {target_date_str} 无数据，使用最近数据")
+                current_price = float(df['close'].iloc[-1])
+                prev_close = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
+                analysis_df = df.copy()
             
             # 基础过滤
             if not (2 <= current_price <= 300):
                 return None
             
             # 技术指标计算
-            tech_score = self._calculate_tech_indicators(df)
+            tech_score = self._calculate_tech_indicators(analysis_df)
             
             # 竞价数据分析
-            auction_data = self.get_auction_data_quick(symbol)
+            auction_data = self.get_auction_data_for_date(symbol, self.analysis_date)
             auction_score = self._analyze_auction_signals(auction_data, prev_close)
             
             # 综合评分
@@ -219,16 +276,18 @@ class DailyReportGenerator:
                 'auction_ratio': auction_score['ratio'],
                 'gap_type': auction_score['gap_type'],
                 'capital_bias': auction_score.get('capital_bias', 0),
-                'rsi': self._calculate_rsi(df),
-                'volume_ratio': self._calculate_volume_ratio(df),
+                'rsi': self._calculate_rsi(analysis_df),
+                'volume_ratio': self._calculate_volume_ratio(analysis_df),
                 'entry_price': current_price,
                 'stop_loss': round(current_price * 0.92, 2),
                 'target_price': round(current_price * 1.15, 2),
                 'confidence': self._determine_confidence(total_score, auction_score),
-                'strategy': self._generate_strategy(auction_score)
+                'strategy': self._generate_strategy(auction_score),
+                'analysis_date': self.analysis_date.strftime('%Y-%m-%d')
             }
             
-        except Exception:
+        except Exception as e:
+            st.error(f"分析股票失败 {symbol}: {e}")
             return None
     
     def _calculate_tech_indicators(self, df: pd.DataFrame) -> float:
@@ -292,7 +351,7 @@ class DailyReportGenerator:
     
     def _analyze_auction_signals(self, auction_data: dict, prev_close: float) -> dict:
         """分析竞价信号"""
-        if auction_data['status'] != 'success' or auction_data['final_price'] == 0:
+        if auction_data['status'] == 'no_data' or auction_data['final_price'] == 0:
             return {
                 'strength': 0.3,
                 'ratio': 0,
@@ -328,6 +387,10 @@ class DailyReportGenerator:
         if auction_data['data_points'] >= 8:
             strength += 0.1
         
+        # 如果是估算数据，适当调整强度
+        if auction_data['status'] == 'estimated':
+            strength *= 0.9
+        
         return {
             'strength': max(0, min(1, strength)),
             'ratio': round(ratio, 2),
@@ -339,12 +402,16 @@ class DailyReportGenerator:
         """获取市场类型"""
         if symbol.startswith('sh.6'):
             return '上海主板'
+        elif symbol.startswith('sh.688'):
+            return '科创板'
         elif symbol.startswith('sz.000'):
             return '深圳主板'
         elif symbol.startswith('sz.002'):
             return '中小板'
         elif symbol.startswith('sz.30'):
             return '创业板'
+        elif symbol.startswith('sz.00'):
+            return '深圳主板'
         return '其他'
     
     def _determine_confidence(self, total_score: float, auction_score: dict) -> str:
@@ -373,12 +440,29 @@ class DailyReportGenerator:
         else:
             return "竞价信号一般，建议观望"
     
+    def get_trading_dates(self, year: int) -> list:
+        """获取指定年份的交易日列表"""
+        try:
+            lg = bs.login()
+            rs = bs.query_trade_dates(start_date=f"{year}-01-01", end_date=f"{year}-12-31")
+            data = rs.get_data()
+            bs.logout()
+            
+            if not data.empty:
+                trading_dates = data[data['is_trading_day'] == '1']['calendar_date'].tolist()
+                return trading_dates
+        except:
+            pass
+        
+        # 如果获取失败，返回空列表
+        return []
+    
     def generate_daily_report(self) -> dict:
         """生成每日报告"""
-        st.info("🔄 开始生成交易日报...")
+        st.info(f"🔄 开始生成 {self.analysis_date.strftime('%Y-%m-%d')} 交易日报...")
         
         if not self.is_trading_day():
-            st.warning("📅 今日非交易日，跳过报告生成")
+            st.warning(f"📅 {self.analysis_date.strftime('%Y-%m-%d')} 非交易日，跳过报告生成")
             return {}
         
         # 连接数据源
@@ -388,7 +472,7 @@ class DailyReportGenerator:
         try:
             # 获取股票列表
             st.info("🔍 获取股票列表...")
-            stock_rs = bs.query_all_stock(day=datetime.now().strftime('%Y-%m-%d'))
+            stock_rs = bs.query_all_stock(day=self.analysis_date.strftime('%Y-%m-%d'))
             all_stocks = stock_rs.get_data()
             
             if all_stocks.empty:
@@ -397,7 +481,8 @@ class DailyReportGenerator:
             
             # 快速采样分析 (限制数量以提高速度)
             markets = {
-                '上海主板': all_stocks[all_stocks['code'].str.startswith('sh.6')],
+                '上海主板': all_stocks[all_stocks['code'].str.startswith('sh.6') & ~all_stocks['code'].str.startswith('sh.688')],
+                '科创板': all_stocks[all_stocks['code'].str.startswith('sh.688')],
                 '深圳主板': all_stocks[all_stocks['code'].str.startswith('sz.000')],
                 '中小板': all_stocks[all_stocks['code'].str.startswith('sz.002')],
                 '创业板': all_stocks[all_stocks['code'].str.startswith('sz.30')]
@@ -406,7 +491,7 @@ class DailyReportGenerator:
             sample_stocks = []
             for market_name, market_stocks in markets.items():
                 if len(market_stocks) > 0:
-                    sample_size = min(15, len(market_stocks))
+                    sample_size = min(20, len(market_stocks))  # 每个市场采样20只
                     sampled = market_stocks.sample(n=sample_size, random_state=42)
                     sample_stocks.append(sampled)
             
@@ -444,6 +529,7 @@ class DailyReportGenerator:
                         auction_stats['gap_down_count'] += 1
                 
                 progress_bar.progress((idx + 1) / len(final_sample))
+                time.sleep(0.1)  # 稍微延迟，避免请求过快
             
             progress_bar.empty()
             status_text.empty()
@@ -460,9 +546,9 @@ class DailyReportGenerator:
             
             # 生成报告数据
             report_data = {
-                'date': datetime.now().strftime('%Y-%m-%d'),
+                'date': self.analysis_date.strftime('%Y-%m-%d'),
                 'analysis_time': datetime.now().strftime('%H:%M:%S'),
-                'recommendations': recommendations[:15],
+                'recommendations': recommendations[:20],  # 限制推荐数量为前20只
                 'market_summary': {
                     'total_analyzed': len(final_sample),
                     'total_recommended': len(recommendations),
@@ -477,15 +563,22 @@ class DailyReportGenerator:
             }
             
             # 保存详细结果
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
             os.makedirs(data_dir, exist_ok=True)
-            json_file = os.path.join(data_dir, f'daily_report_{timestamp}.json')
+            
+            filename = f"daily_report_{self.analysis_date.strftime('%Y%m%d')}_{datetime.now().strftime('%H%M%S')}.json"
+            json_file = os.path.join(data_dir, filename)
             
             with open(json_file, 'w', encoding='utf-8') as f:
                 json.dump(report_data, f, ensure_ascii=False, indent=2)
             
             report_data['json_file'] = json_file
+            
+            st.success(f"✅ 日报生成完成!")
+            st.info(f"   📊 分析股票: {len(final_sample)}只")
+            st.info(f"   🎯 推荐股票: {len(recommendations)}只")
+            st.info(f"   📈 平均评分: {avg_score:.3f}")
+            st.info(f"   💾 详细数据: {json_file}")
             
             return report_data
             
@@ -504,13 +597,18 @@ def display_dashboard(report_data):
     st.markdown("<h1 class='main-header'>📊 CChanTrader-AI 交易日报</h1>", unsafe_allow_html=True)
     
     # 日期时间信息
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("报告日期", report_data.get('date', 'N/A'))
+        st.metric("分析日期", report_data.get('date', 'N/A'))
     with col2:
         st.metric("生成时间", report_data.get('analysis_time', 'N/A'))
     with col3:
         st.metric("推荐股票", len(report_data.get('recommendations', [])))
+    with col4:
+        # 计算平均评分
+        recommendations = report_data.get('recommendations', [])
+        avg_score = sum(r.get('total_score', 0) for r in recommendations) / max(len(recommendations), 1)
+        st.metric("平均评分", f"{avg_score:.3f}")
     
     st.markdown("---")
     
@@ -543,14 +641,17 @@ def display_dashboard(report_data):
                 auction_analysis.get('gap_down_count', 0)
             ]
         }
-        fig_gap = px.pie(
-            gap_data, 
-            values='数量', 
-            names='类型',
-            title='竞价缺口类型分布',
-            color_discrete_sequence=['#4caf50', '#ff9800', '#f44336']
-        )
-        st.plotly_chart(fig_gap, use_container_width=True)
+        if sum(gap_data['数量']) > 0:
+            fig_gap = px.pie(
+                gap_data, 
+                values='数量', 
+                names='类型',
+                title='竞价缺口类型分布',
+                color_discrete_sequence=['#4caf50', '#ff9800', '#f44336']
+            )
+            st.plotly_chart(fig_gap, use_container_width=True)
+        else:
+            st.info("无竞价数据")
     
     with col2:
         # 评分分布直方图
@@ -612,10 +713,19 @@ def display_dashboard(report_data):
             height=400
         )
         
+        # 导出数据按钮
+        csv = df_display.to_csv(index=False, encoding='utf-8-sig')
+        st.download_button(
+            label="📥 下载推荐列表 (CSV)",
+            data=csv,
+            file_name=f"recommendations_{report_data.get('date', 'unknown')}.csv",
+            mime="text/csv"
+        )
+        
         # 详细股票卡片（可展开）
         with st.expander("查看详细股票分析"):
-            for idx, stock in enumerate(recommendations[:5]):  # 只显示前5只详细分析
-                col1, col2, col3 = st.columns(3)
+            for idx, stock in enumerate(recommendations[:10]):  # 只显示前10只详细分析
+                col1, col2, col3, col4 = st.columns(4)
                 
                 with col1:
                     st.markdown(f"**{stock['stock_name']} ({stock['symbol']})**")
@@ -635,9 +745,16 @@ def display_dashboard(report_data):
                     st.markdown(f"策略: {stock['strategy']}")
                 
                 with col3:
+                    st.markdown(f"技术评分: {stock['tech_score']:.3f}")
+                    st.markdown(f"竞价评分: {stock['auction_score']:.3f}")
+                    st.markdown(f"竞价涨幅: {stock['auction_ratio']:.2f}%")
+                
+                with col4:
                     st.markdown(f"止损价: ¥{stock['stop_loss']:.2f}")
                     st.markdown(f"目标价: ¥{stock['target_price']:.2f}")
-                    st.markdown(f"盈亏比: {((stock['target_price'] - stock['current_price'])/(stock['current_price'] - stock['stop_loss'])):.2f}")
+                    profit_ratio = ((stock['target_price'] - stock['current_price']) / stock['current_price']) * 100
+                    loss_ratio = ((stock['current_price'] - stock['stop_loss']) / stock['current_price']) * 100
+                    st.markdown(f"预期收益: +{profit_ratio:.1f}% / -{loss_ratio:.1f}%")
                 
                 st.markdown("---")
     else:
@@ -648,153 +765,144 @@ def display_dashboard(report_data):
     st.markdown(f"📁 详细数据已保存至: `{report_data.get('json_file', 'N/A')}`")
 
 
-def quick_test_report():
-    """快速测试报告生成"""
-    st.info("🧪 快速测试日报生成...")
-    
-    # 模拟报告数据
-    mock_data = {
-        'date': datetime.now().strftime('%Y-%m-%d'),
-        'analysis_time': datetime.now().strftime('%H:%M:%S'),
-        'recommendations': [
-            {
-                'symbol': 'sh.600000',
-                'stock_name': '浦发银行',
-                'market': '上海主板',
-                'current_price': 13.65,
-                'total_score': 0.856,
-                'tech_score': 0.750,
-                'auction_score': 0.720,
-                'auction_ratio': 1.2,
-                'gap_type': 'gap_up',
-                'capital_bias': 0.68,
-                'rsi': 65.2,
-                'volume_ratio': 1.3,
-                'entry_price': 13.65,
-                'stop_loss': 12.56,
-                'target_price': 15.70,
-                'confidence': 'very_high',
-                'strategy': '温和高开，开盘可买'
-            },
-            {
-                'symbol': 'sz.000001',
-                'stock_name': '平安银行',
-                'market': '深圳主板',
-                'current_price': 12.38,
-                'total_score': 0.789,
-                'tech_score': 0.680,
-                'auction_score': 0.650,
-                'auction_ratio': 0.8,
-                'gap_type': 'flat',
-                'capital_bias': 0.55,
-                'rsi': 58.1,
-                'volume_ratio': 1.1,
-                'entry_price': 12.38,
-                'stop_loss': 11.39,
-                'target_price': 14.24,
-                'confidence': 'high',
-                'strategy': '平开强势，关注买入'
-            },
-            {
-                'symbol': 'sz.002142',
-                'stock_name': '宁波银行',
-                'market': '中小板',
-                'current_price': 25.67,
-                'total_score': 0.823,
-                'tech_score': 0.710,
-                'auction_score': 0.680,
-                'auction_ratio': 0.5,
-                'gap_type': 'flat',
-                'capital_bias': 0.62,
-                'rsi': 55.8,
-                'volume_ratio': 0.95,
-                'entry_price': 25.67,
-                'stop_loss': 23.62,
-                'target_price': 29.52,
-                'confidence': 'high',
-                'strategy': '平开强势，关注买入'
-            }
-        ],
-        'market_summary': {
-            'total_analyzed': 60,
-            'total_recommended': 3,
-            'avg_score': 0.823
-        },
-        'auction_analysis': {
-            'avg_auction_ratio': 1.0,
-            'gap_up_count': 25,
-            'flat_count': 20,
-            'gap_down_count': 15
-        }
-    }
-    
-    return mock_data
+def load_historical_reports():
+    """加载历史报告列表"""
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+    if os.path.exists(data_dir):
+        report_files = [f for f in os.listdir(data_dir) 
+                       if f.startswith('daily_report_') and f.endswith('.json')]
+        return sorted(report_files, reverse=True)
+    return []
 
 
 def main():
     """主函数"""
+    
+    # 初始化session state
+    if 'report_data' not in st.session_state:
+        st.session_state['report_data'] = None
+    if 'analysis_date' not in st.session_state:
+        st.session_state['analysis_date'] = datetime.now()
     
     # 侧边栏
     with st.sidebar:
         st.image("https://via.placeholder.com/300x100/1E88E5/ffffff?text=CChanTrader-AI", use_column_width=True)
         st.markdown("## 控制面板")
         
-        # 模式选择
-        mode = st.radio(
-            "选择模式",
-            ["实时分析", "测试模式", "加载历史报告"]
+        # 日期选择
+        st.markdown("### 📅 选择分析日期")
+        
+        # 预设常用日期选项
+        date_option = st.radio(
+            "日期选择",
+            ["今天", "昨天", "指定日期", "选择交易日"]
         )
         
-        if mode == "加载历史报告":
-            # 列出历史报告文件
-            data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
-            if os.path.exists(data_dir):
-                report_files = [f for f in os.listdir(data_dir) if f.startswith('daily_report_') and f.endswith('.json')]
-                if report_files:
-                    selected_file = st.selectbox("选择历史报告", report_files)
-                    if selected_file:
-                        file_path = os.path.join(data_dir, selected_file)
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            report_data = json.load(f)
-                        st.session_state['report_data'] = report_data
-                        st.success(f"已加载: {selected_file}")
-                else:
-                    st.info("暂无历史报告")
+        if date_option == "今天":
+            selected_date = datetime.now()
+        elif date_option == "昨天":
+            selected_date = datetime.now() - timedelta(days=1)
+        elif date_option == "指定日期":
+            selected_date = st.date_input(
+                "选择日期",
+                value=datetime.now(),
+                min_value=datetime(2020, 1, 1),
+                max_value=datetime.now()
+            )
+            selected_date = datetime.combine(selected_date, datetime.min.time())
+        else:  # 选择交易日
+            # 这里可以添加交易日选择逻辑
+            year = st.selectbox("选择年份", range(2020, datetime.now().year + 1))
+            
+            # 获取交易日列表
+            generator = DailyReportGenerator()
+            trading_dates = generator.get_trading_dates(year)
+            
+            if trading_dates:
+                selected_trading_date = st.selectbox("选择交易日", trading_dates)
+                selected_date = datetime.strptime(selected_trading_date, '%Y-%m-%d')
+            else:
+                st.warning("无法获取交易日列表，使用今天")
+                selected_date = datetime.now()
+        
+        st.session_state['analysis_date'] = selected_date
+        st.info(f"当前选择: {selected_date.strftime('%Y-%m-%d')}")
         
         st.markdown("---")
-        st.markdown("### 关于")
-        st.markdown("CChanTrader-AI 交易日报生成器")
-        st.markdown("在每个交易日9:25-9:29自动分析")
+        
+        # 模式选择
+        st.markdown("### 🎯 操作")
         
         # 生成报告按钮
-        if st.button("🚀 生成新报告", type="primary", use_container_width=True):
-            with st.spinner("正在生成报告..."):
-                generator = DailyReportGenerator()
+        if st.button("🚀 生成报告", type="primary", use_container_width=True):
+            with st.spinner(f"正在生成 {selected_date.strftime('%Y-%m-%d')} 报告..."):
+                generator = DailyReportGenerator(analysis_date=selected_date)
                 report_data = generator.generate_daily_report()
                 if report_data:
                     st.session_state['report_data'] = report_data
                     st.success("报告生成成功!")
+                    st.rerun()
                 else:
                     st.error("报告生成失败")
         
         if st.button("🧪 测试模式", use_container_width=True):
-            mock_data = quick_test_report()
+            mock_data = quick_test_report(selected_date)
             st.session_state['report_data'] = mock_data
             st.success("测试数据已加载")
+            st.rerun()
+        
+        st.markdown("---")
+        
+        # 历史报告
+        st.markdown("### 📚 历史报告")
+        report_files = load_historical_reports()
+        
+        if report_files:
+            selected_file = st.selectbox("选择历史报告", report_files)
+            if selected_file and st.button("📂 加载报告", use_container_width=True):
+                data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+                file_path = os.path.join(data_dir, selected_file)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        report_data = json.load(f)
+                    st.session_state['report_data'] = report_data
+                    st.success(f"已加载: {selected_file}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"加载失败: {e}")
+        else:
+            st.info("暂无历史报告")
+        
+        st.markdown("---")
+        
+        # 关于信息
+        with st.expander("ℹ️ 关于"):
+            st.markdown("""
+            **CChanTrader-AI 交易日报生成器**
+            
+            - 支持选择任意日期分析
+            - 每个交易日9:25-9:29自动分析
+            - 结合竞价数据和技术指标
+            - 智能评分和策略建议
+            """)
     
     # 主内容区域
-    if 'report_data' in st.session_state and st.session_state['report_data']:
+    if st.session_state['report_data']:
         display_dashboard(st.session_state['report_data'])
     else:
         # 欢迎页面
         st.markdown("<h1 class='main-header'>欢迎使用 CChanTrader-AI</h1>", unsafe_allow_html=True)
+        
+        # 当前选择日期显示
+        st.markdown(f"<h3 style='text-align: center;'>当前选择: {st.session_state['analysis_date'].strftime('%Y-%m-%d')}</h3>", 
+                   unsafe_allow_html=True)
         
         col1, col2, col3 = st.columns(3)
         with col1:
             st.markdown("""
             <div class='info-box'>
                 <h3>📊 实时分析</h3>
-                <p>点击左侧"生成新报告"开始实时分析</p>
+                <p>选择日期后点击"生成报告"开始分析</p>
             </div>
             """, unsafe_allow_html=True)
         
@@ -819,12 +927,119 @@ def main():
         st.markdown("""
         ### ✨ 功能特点
         
-        - **自动分析**：每个交易日9:25-9:29自动分析股票
-        - **竞价分析**：结合竞价数据判断开盘强弱
-        - **技术指标**：综合RSI、均线、成交量等技术指标
-        - **智能评分**：基于多维度数据给出综合评分
-        - **策略建议**：根据竞价情况给出具体操作建议
+        - **📅 日期选择**：支持任意历史日期分析
+        - **🔍 竞价分析**：结合竞价数据判断开盘强弱
+        - **📊 技术指标**：综合RSI、均线、成交量等技术指标
+        - **🎯 智能评分**：基于多维度数据给出综合评分
+        - **💡 策略建议**：根据竞价情况给出具体操作建议
         """)
+
+
+def quick_test_report(analysis_date=None):
+    """快速测试报告生成"""
+    if analysis_date is None:
+        analysis_date = datetime.now()
+    
+    # 模拟报告数据
+    mock_data = {
+        'date': analysis_date.strftime('%Y-%m-%d'),
+        'analysis_time': datetime.now().strftime('%H:%M:%S'),
+        'recommendations': [
+            {
+                'symbol': 'sh.600000',
+                'stock_name': '浦发银行',
+                'market': '上海主板',
+                'current_price': 13.65,
+                'total_score': 0.856,
+                'tech_score': 0.750,
+                'auction_score': 0.720,
+                'auction_ratio': 1.2,
+                'gap_type': 'gap_up',
+                'capital_bias': 0.68,
+                'rsi': 65.2,
+                'volume_ratio': 1.3,
+                'entry_price': 13.65,
+                'stop_loss': 12.56,
+                'target_price': 15.70,
+                'confidence': 'very_high',
+                'strategy': '温和高开，开盘可买',
+                'analysis_date': analysis_date.strftime('%Y-%m-%d')
+            },
+            {
+                'symbol': 'sz.000001',
+                'stock_name': '平安银行',
+                'market': '深圳主板',
+                'current_price': 12.38,
+                'total_score': 0.789,
+                'tech_score': 0.680,
+                'auction_score': 0.650,
+                'auction_ratio': 0.8,
+                'gap_type': 'flat',
+                'capital_bias': 0.55,
+                'rsi': 58.1,
+                'volume_ratio': 1.1,
+                'entry_price': 12.38,
+                'stop_loss': 11.39,
+                'target_price': 14.24,
+                'confidence': 'high',
+                'strategy': '平开强势，关注买入',
+                'analysis_date': analysis_date.strftime('%Y-%m-%d')
+            },
+            {
+                'symbol': 'sz.002142',
+                'stock_name': '宁波银行',
+                'market': '中小板',
+                'current_price': 25.67,
+                'total_score': 0.823,
+                'tech_score': 0.710,
+                'auction_score': 0.680,
+                'auction_ratio': 0.5,
+                'gap_type': 'flat',
+                'capital_bias': 0.62,
+                'rsi': 55.8,
+                'volume_ratio': 0.95,
+                'entry_price': 25.67,
+                'stop_loss': 23.62,
+                'target_price': 29.52,
+                'confidence': 'high',
+                'strategy': '平开强势，关注买入',
+                'analysis_date': analysis_date.strftime('%Y-%m-%d')
+            },
+            {
+                'symbol': 'sh.600036',
+                'stock_name': '招商银行',
+                'market': '上海主板',
+                'current_price': 36.42,
+                'total_score': 0.791,
+                'tech_score': 0.690,
+                'auction_score': 0.630,
+                'auction_ratio': 0.3,
+                'gap_type': 'flat',
+                'capital_bias': 0.58,
+                'rsi': 52.3,
+                'volume_ratio': 0.88,
+                'entry_price': 36.42,
+                'stop_loss': 33.51,
+                'target_price': 41.88,
+                'confidence': 'medium',
+                'strategy': '竞价信号一般，建议观望',
+                'analysis_date': analysis_date.strftime('%Y-%m-%d')
+            }
+        ],
+        'market_summary': {
+            'total_analyzed': 80,
+            'total_recommended': 4,
+            'avg_score': 0.815
+        },
+        'auction_analysis': {
+            'avg_auction_ratio': 0.7,
+            'gap_up_count': 18,
+            'flat_count': 15,
+            'gap_down_count': 12
+        }
+    }
+    
+    return mock_data
 
 
 if __name__ == "__main__":
