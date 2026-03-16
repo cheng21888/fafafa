@@ -3,6 +3,7 @@
 """
 A股集合竞价数据获取演示程序 - Streamlit版本
 整合AKShare和BaoStock，展示完整的竞价数据分析流程
+支持全市场A股分析
 """
 
 import streamlit as st
@@ -63,8 +64,78 @@ st.markdown("""
         font-size: 0.9rem;
         color: #616161;
     }
+    .stProgress > div > div > div > div {
+        background-color: #1E88E5;
+    }
 </style>
 """, unsafe_allow_html=True)
+
+# 缓存函数，避免重复请求
+@st.cache_data(ttl=3600)  # 缓存1小时
+def get_all_stock_list():
+    """获取所有A股股票列表"""
+    try:
+        with st.spinner('正在获取A股股票列表...'):
+            # 获取所有A股股票信息
+            stock_info = ak.stock_info_a_code_name()
+            
+            # 添加市场标识
+            stock_info['market'] = stock_info['code'].apply(
+                lambda x: 'sh' if x.startswith('6') else 'sz'
+            )
+            stock_info['baostock_code'] = stock_info['market'] + '.' + stock_info['code']
+            stock_info['display_name'] = stock_info['code'] + ' - ' + stock_info['name']
+            
+            return stock_info
+    except Exception as e:
+        st.error(f"获取股票列表失败: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=300)  # 缓存5分钟
+def get_stock_list_by_sector(sector_type):
+    """按板块获取股票列表"""
+    try:
+        if sector_type == "沪深300":
+            df = ak.stock_zh_index_cons_csindex("000300")
+            return df[['成分券代码', '成分券名称']].rename(
+                columns={'成分券代码': 'code', '成分券名称': 'name'}
+            )
+        elif sector_type == "中证500":
+            df = ak.stock_zh_index_cons_csindex("000905")
+            return df[['成分券代码', '成分券名称']].rename(
+                columns={'成分券代码': 'code', '成分券名称': 'name'}
+            )
+        elif sector_type == "科创板":
+            all_stocks = get_all_stock_list()
+            return all_stocks[all_stocks['code'].str.startswith('688')]
+        elif sector_type == "创业板":
+            all_stocks = get_all_stock_list()
+            return all_stocks[all_stocks['code'].str.startswith('30')]
+        elif sector_type == "主板":
+            all_stocks = get_all_stock_list()
+            return all_stocks[
+                (all_stocks['code'].str.startswith(('60', '00'))) & 
+                (~all_stocks['code'].str.startswith('300'))
+            ]
+        else:
+            return get_all_stock_list()
+    except Exception as e:
+        st.error(f"获取{sector_type}股票列表失败: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=60)  # 缓存1分钟
+def get_hot_stocks(top_n=20):
+    """获取热门股票（基于成交额）"""
+    try:
+        # 获取实时行情数据
+        stock_zh_a_spot = ak.stock_zh_a_spot_em()
+        # 按成交额排序
+        hot_stocks = stock_zh_a_spot.nlargest(top_n, '成交额')[['代码', '名称']]
+        hot_stocks.columns = ['code', 'name']
+        return hot_stocks
+    except Exception as e:
+        st.warning(f"获取热门股票失败: {e}")
+        return pd.DataFrame()
 
 class AuctionDataAnalyzer:
     """集合竞价数据分析器"""
@@ -72,6 +143,7 @@ class AuctionDataAnalyzer:
     def __init__(self):
         self.name = "A股集合竞价数据分析器"
         self.baostock_logged_in = False
+        self.results_cache = {}
         
     def login_baostock(self):
         """登录BaoStock"""
@@ -161,7 +233,7 @@ class AuctionDataAnalyzer:
                     ma_desc = "均线纠结"
                 
                 score += ma_score
-                details['ma'] = {'score': ma_score, 'desc': ma_desc}
+                details['ma'] = {'score': ma_score, 'desc': ma_desc, 'value': f"{ma5:.2f}/{ma10:.2f}/{ma20:.2f}"}
             
             # RSI评分
             rsi = self._calculate_rsi(df)
@@ -217,54 +289,52 @@ class AuctionDataAnalyzer:
     def get_akshare_auction_data(self, symbol):
         """使用AKShare获取集合竞价数据"""
         try:
-            with st.spinner(f'正在获取 {symbol} 的AKShare数据...'):
-                pre_market_df = ak.stock_zh_a_hist_pre_min_em(
-                    symbol=symbol,
-                    start_time="09:00:00",
-                    end_time="09:30:00"
-                )
-                
-                if pre_market_df.empty:
-                    return None
-                
-                auction_df = pre_market_df[
-                    pre_market_df['时间'].str.contains('09:1[5-9]|09:2[0-5]', na=False)
-                ].copy()
-                
-                if auction_df.empty:
-                    return None
-                
-                opening_price = auction_df['收盘'].iloc[-1] if len(auction_df) > 0 else None
-                total_volume = auction_df['成交量'].sum()
-                total_amount = auction_df['成交额'].sum()
-                price_high = auction_df['最高'].max()
-                price_low = auction_df['最低'].min()
-                
-                if len(auction_df) >= 2:
-                    first_price = auction_df['收盘'].iloc[0]
-                    last_price = auction_df['收盘'].iloc[-1]
-                    trend_pct = (last_price - first_price) / first_price * 100
-                else:
-                    trend_pct = 0
-                
-                result = {
-                    'symbol': symbol,
-                    'data_source': 'AKShare',
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'opening_price': float(opening_price) if opening_price else None,
-                    'auction_high': float(price_high),
-                    'auction_low': float(price_low),
-                    'total_volume': int(total_volume),
-                    'total_amount': float(total_amount),
-                    'trend_pct': round(trend_pct, 2),
-                    'data_points': len(auction_df),
-                    'raw_data': auction_df
-                }
-                
-                return result
+            pre_market_df = ak.stock_zh_a_hist_pre_min_em(
+                symbol=symbol,
+                start_time="09:00:00",
+                end_time="09:30:00"
+            )
+            
+            if pre_market_df.empty:
+                return None
+            
+            auction_df = pre_market_df[
+                pre_market_df['时间'].str.contains('09:1[5-9]|09:2[0-5]', na=False)
+            ].copy()
+            
+            if auction_df.empty:
+                return None
+            
+            opening_price = auction_df['收盘'].iloc[-1] if len(auction_df) > 0 else None
+            total_volume = auction_df['成交量'].sum()
+            total_amount = auction_df['成交额'].sum()
+            price_high = auction_df['最高'].max()
+            price_low = auction_df['最低'].min()
+            
+            if len(auction_df) >= 2:
+                first_price = auction_df['收盘'].iloc[0]
+                last_price = auction_df['收盘'].iloc[-1]
+                trend_pct = (last_price - first_price) / first_price * 100
+            else:
+                trend_pct = 0
+            
+            result = {
+                'symbol': symbol,
+                'data_source': 'AKShare',
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'opening_price': float(opening_price) if opening_price else None,
+                'auction_high': float(price_high),
+                'auction_low': float(price_low),
+                'total_volume': int(total_volume),
+                'total_amount': float(total_amount),
+                'trend_pct': round(trend_pct, 2),
+                'data_points': len(auction_df),
+                'raw_data': auction_df
+            }
+            
+            return result
                 
         except Exception as e:
-            st.error(f"获取{symbol} AKShare数据失败: {e}")
             return None
     
     def get_baostock_opening_data(self, symbol, days=20):
@@ -323,7 +393,6 @@ class AuctionDataAnalyzer:
             return result
             
         except Exception as e:
-            st.error(f"获取{symbol} BaoStock数据失败: {e}")
             return None
     
     def analyze_auction_signals(self, akshare_data, baostock_data=None):
@@ -442,8 +511,39 @@ class AuctionDataAnalyzer:
         }
         
         return analysis
+    
+    def analyze_stock(self, symbol, stock_name=""):
+        """分析单只股票"""
+        cache_key = f"{symbol}_{datetime.now().strftime('%Y%m%d%H')}"
+        
+        if cache_key in self.results_cache:
+            return self.results_cache[cache_key]
+        
+        # 转换股票代码格式
+        baostock_symbol = f"sh.{symbol}" if symbol.startswith('6') else f"sz.{symbol}"
+        
+        # 获取数据
+        akshare_data = self.get_akshare_auction_data(symbol)
+        baostock_data = self.get_baostock_opening_data(baostock_symbol, days=20)
+        
+        # 分析信号
+        if akshare_data:
+            analysis = self.analyze_auction_signals(akshare_data, baostock_data)
+            
+            result = {
+                'symbol': symbol,
+                'name': stock_name,
+                'akshare_data': akshare_data,
+                'baostock_data': baostock_data,
+                'analysis': analysis
+            }
+            
+            self.results_cache[cache_key] = result
+            return result
+        
+        return None
 
-def create_auction_chart(akshare_data):
+def create_auction_chart(akshare_data, stock_name=""):
     """创建集合竞价图表"""
     if not akshare_data or 'raw_data' not in akshare_data:
         return None
@@ -487,8 +587,10 @@ def create_auction_chart(akshare_data):
     )
     
     # 更新布局
+    title = f"{akshare_data['symbol']} {stock_name} 集合竞价走势" if stock_name else f"{akshare_data['symbol']} 集合竞价走势"
+    
     fig.update_layout(
-        title=f"{akshare_data['symbol']} 集合竞价走势",
+        title=title,
         xaxis_title="时间",
         height=600,
         showlegend=False,
@@ -504,13 +606,14 @@ def create_auction_chart(akshare_data):
 def display_stock_table(results):
     """显示股票数据表格"""
     if not results:
-        return
+        return None
     
     table_data = []
     for result in results:
-        if result['analysis']:
+        if result and result['analysis']:
             row = {
                 '股票代码': result['symbol'],
+                '股票名称': result.get('name', ''),
                 '开盘价': f"¥{result['akshare_data']['opening_price']:.2f}" if result['akshare_data']['opening_price'] else 'N/A',
                 '竞价趋势': f"{result['akshare_data']['trend_pct']:+.2f}%",
                 '成交量(手)': f"{result['akshare_data']['total_volume']:,}",
@@ -533,6 +636,7 @@ def display_stock_table(results):
             hide_index=True,
             column_config={
                 '股票代码': st.column_config.TextColumn('股票代码', width='small'),
+                '股票名称': st.column_config.TextColumn('股票名称', width='small'),
                 '开盘价': st.column_config.TextColumn('开盘价', width='small'),
                 '竞价趋势': st.column_config.TextColumn('竞价趋势', width='small'),
                 '成交量(手)': st.column_config.TextColumn('成交量(手)', width='medium'),
@@ -564,6 +668,7 @@ def display_technical_details(baostock_data):
                 details['ma']['desc'],
                 f"评分: {details['ma']['score']:+.2f}"
             )
+            st.caption(f"MA5/MA10/MA20: {details['ma']['value']}")
     
     with col2:
         if 'rsi' in details:
@@ -583,52 +688,137 @@ def display_technical_details(baostock_data):
 
 def main():
     """主函数"""
-    st.markdown('<h1 class="main-header">📊 A股集合竞价分析系统</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">📊 A股集合竞价分析系统 - 全市场版</h1>', unsafe_allow_html=True)
     
     # 侧边栏配置
     with st.sidebar:
         st.markdown('<h2 class="sub-header">⚙️ 配置面板</h2>', unsafe_allow_html=True)
         
+        # 获取所有股票列表
+        all_stocks_df = get_all_stock_list()
+        
+        if all_stocks_df.empty:
+            st.error("无法获取股票列表，请检查网络连接")
+            return
+        
         # 股票选择方式
-        input_method = st.radio(
-            "选择输入方式",
-            ["示例股票列表", "手动输入股票代码", "上传股票列表"]
+        selection_method = st.radio(
+            "选择股票方式",
+            ["按板块筛选", "搜索股票代码", "热门股票", "自定义列表"]
         )
         
-        stocks = []
+        selected_stocks = []
+        stock_display_names = []
         
-        if input_method == "示例股票列表":
-            stocks = st.multiselect(
-                "选择要分析的股票",
-                [
-                    "000001 (平安银行)",
-                    "000002 (万科A)",
-                    "600000 (浦发银行)",
-                    "600036 (招商银行)",
-                    "300015 (爱尔眼科)",
-                    "600519 (贵州茅台)",
-                    "000858 (五粮液)"
-                ],
-                default=["000001 (平安银行)", "000002 (万科A)"]
+        if selection_method == "按板块筛选":
+            sector = st.selectbox(
+                "选择板块",
+                ["全部A股", "沪深300", "中证500", "主板", "创业板", "科创板"]
             )
-            stocks = [s.split(' ')[0] for s in stocks]
             
-        elif input_method == "手动输入股票代码":
-            stock_input = st.text_input(
-                "输入股票代码（多个用逗号分隔）",
-                placeholder="例如: 000001,000002,600000"
-            )
-            if stock_input:
-                stocks = [s.strip() for s in stock_input.split(',')]
+            if sector == "全部A股":
+                sector_stocks = all_stocks_df
+            else:
+                sector_stocks = get_stock_list_by_sector(sector)
+            
+            if not sector_stocks.empty:
+                # 显示股票数量
+                st.info(f"共 {len(sector_stocks)} 只股票")
+                
+                # 选择数量限制
+                max_stocks = st.slider("最大分析数量", min_value=5, max_value=50, value=10, step=5)
+                
+                # 排序选项
+                sort_by = st.radio(
+                    "排序方式",
+                    ["按代码", "随机采样"]
+                )
+                
+                if sort_by == "按代码":
+                    sector_stocks = sector_stocks.sort_values('code')
+                    selected_df = sector_stocks.head(max_stocks)
+                else:
+                    selected_df = sector_stocks.sample(n=min(max_stocks, len(sector_stocks)))
+                
+                selected_stocks = selected_df['code'].tolist()
+                stock_display_names = dict(zip(selected_df['code'], selected_df['name']))
         
-        else:  # 上传文件
-            uploaded_file = st.file_uploader(
-                "上传股票列表文件（每行一个代码）",
-                type=['txt', 'csv']
+        elif selection_method == "搜索股票代码":
+            search_term = st.text_input("输入股票代码或名称", placeholder="例如: 000001 或 平安银行")
+            
+            if search_term:
+                # 搜索匹配的股票
+                mask = (
+                    all_stocks_df['code'].str.contains(search_term) | 
+                    all_stocks_df['name'].str.contains(search_term)
+                )
+                search_results = all_stocks_df[mask]
+                
+                if not search_results.empty:
+                    st.success(f"找到 {len(search_results)} 只匹配股票")
+                    
+                    # 多选
+                    selected_options = st.multiselect(
+                        "选择要分析的股票",
+                        options=search_results['display_name'].tolist(),
+                        default=search_results['display_name'].tolist()[:5]
+                    )
+                    
+                    for option in selected_options:
+                        code = option.split(' - ')[0]
+                        name = option.split(' - ')[1]
+                        selected_stocks.append(code)
+                        stock_display_names[code] = name
+                else:
+                    st.warning("未找到匹配的股票")
+        
+        elif selection_method == "热门股票":
+            top_n = st.slider("热门股票数量", min_value=5, max_value=30, value=10)
+            hot_stocks = get_hot_stocks(top_n)
+            
+            if not hot_stocks.empty:
+                st.success(f"获取到 {len(hot_stocks)} 只热门股票")
+                
+                selected_options = st.multiselect(
+                    "选择要分析的热门股票",
+                    options=[f"{row['code']} - {row['name']}" for _, row in hot_stocks.iterrows()],
+                    default=[f"{row['code']} - {row['name']}" for _, row in hot_stocks.iterrows()][:5]
+                )
+                
+                for option in selected_options:
+                    code = option.split(' - ')[0]
+                    name = option.split(' - ')[1]
+                    selected_stocks.append(code)
+                    stock_display_names[code] = name
+        
+        else:  # 自定义列表
+            custom_input = st.text_area(
+                "输入股票代码（每行一个）",
+                placeholder="例如:\n000001\n000002\n600000"
             )
-            if uploaded_file:
-                content = uploaded_file.read().decode()
-                stocks = [line.strip() for line in content.split('\n') if line.strip()]
+            
+            if custom_input:
+                custom_stocks = [line.strip() for line in custom_input.split('\n') if line.strip()]
+                
+                # 验证股票代码
+                valid_stocks = []
+                for code in custom_stocks:
+                    if code in all_stocks_df['code'].values:
+                        valid_stocks.append(code)
+                        name = all_stocks_df[all_stocks_df['code'] == code]['name'].iloc[0]
+                        stock_display_names[code] = name
+                
+                selected_stocks = valid_stocks
+                
+                if len(valid_stocks) < len(custom_stocks):
+                    st.warning(f"过滤掉 {len(custom_stocks) - len(valid_stocks)} 个无效股票代码")
+        
+        # 分析选项
+        st.markdown("---")
+        st.markdown("### ⚡ 分析选项")
+        
+        use_technical = st.checkbox("使用技术指标分析", value=True)
+        show_charts = st.checkbox("显示K线图表", value=True)
         
         # 分析按钮
         analyze_button = st.button("🚀 开始分析", type="primary", use_container_width=True)
@@ -636,57 +826,55 @@ def main():
         st.markdown("---")
         st.markdown("### ℹ️ 关于")
         st.markdown("""
-        本系统整合AKShare和BaoStock数据源，提供：
-        - 集合竞价实时数据
-        - 技术指标分析
-        - 交易信号识别
-        - 综合评分系统
+        **数据来源：**
+        - AKShare：集合竞价数据
+        - BaoStock：历史行情数据
+        
+        **分析维度：**
+        - 价格趋势
+        - 成交量分析
+        - 波动率评估
+        - 技术指标
         """)
     
     # 主内容区
-    if analyze_button and stocks:
+    if analyze_button and selected_stocks:
         # 初始化分析器
         analyzer = AuctionDataAnalyzer()
         
         # 登录BaoStock
         with st.spinner('正在连接数据源...'):
             if not analyzer.login_baostock():
-                st.error("BaoStock连接失败，部分功能可能不可用")
+                if use_technical:
+                    st.warning("BaoStock连接失败，将仅使用AKShare数据分析")
         
-        # 进度条
+        # 创建进度显示
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         # 存储结果
         results = []
+        failed_stocks = []
         
         # 创建结果显示区域
         results_container = st.container()
         
-        for i, symbol in enumerate(stocks):
-            status_text.text(f"正在分析 {symbol}... ({i+1}/{len(stocks)})")
+        for i, symbol in enumerate(selected_stocks):
+            status_text.text(f"正在分析 {symbol} {stock_display_names.get(symbol, '')}... ({i+1}/{len(selected_stocks)})")
             
-            # 转换股票代码格式
-            akshare_symbol = symbol
-            baostock_symbol = f"sh.{symbol}" if symbol.startswith('6') else f"sz.{symbol}"
+            # 分析股票
+            result = analyzer.analyze_stock(symbol, stock_display_names.get(symbol, ''))
             
-            # 获取数据
-            akshare_data = analyzer.get_akshare_auction_data(akshare_symbol)
-            baostock_data = analyzer.get_baostock_opening_data(baostock_symbol, days=20)
-            
-            # 分析信号
-            if akshare_data:
-                analysis = analyzer.analyze_auction_signals(akshare_data, baostock_data)
-                
-                results.append({
-                    'symbol': symbol,
-                    'akshare_data': akshare_data,
-                    'baostock_data': baostock_data,
-                    'analysis': analysis
-                })
+            if result:
+                results.append(result)
+            else:
+                failed_stocks.append(symbol)
             
             # 更新进度
-            progress_bar.progress((i + 1) / len(stocks))
+            progress_bar.progress((i + 1) / len(selected_stocks))
+            
+            # 避免请求过于频繁
+            time.sleep(0.5)
         
         # 清除进度显示
         progress_bar.empty()
@@ -694,95 +882,160 @@ def main():
         
         # 显示结果
         with results_container:
-            st.markdown('<h2 class="sub-header">📈 分析结果汇总</h2>', unsafe_allow_html=True)
+            if results:
+                st.markdown('<h2 class="sub-header">📈 分析结果汇总</h2>', unsafe_allow_html=True)
+                
+                # 显示数据表格
+                df_display = display_stock_table(results)
+                
+                if df_display is not None:
+                    # 统计信息
+                    st.markdown('<h2 class="sub-header">📊 统计概览</h2>', unsafe_allow_html=True)
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        buy_count = len(df_display[df_display['交易建议'] == '买入'])
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h3>买入建议</h3>
+                            <h2 class="signal-buy">{buy_count}</h2>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    with col2:
+                        sell_count = len(df_display[df_display['交易建议'] == '卖出'])
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h3>卖出建议</h3>
+                            <h2 class="signal-sell">{sell_count}</h2>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    with col3:
+                        hold_count = len(df_display[df_display['交易建议'] == '持有'])
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h3>持有建议</h3>
+                            <h2 class="signal-hold">{hold_count}</h2>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    with col4:
+                        avg_score = pd.to_numeric(df_display['技术评分'].replace('N/A', np.nan)).mean()
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h3>平均技术评分</h3>
+                            <h2>{avg_score:.3f}</h2>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # 失败股票提示
+                    if failed_stocks:
+                        st.warning(f"以下股票分析失败: {', '.join(failed_stocks)}")
+                    
+                    # 详细分析标签页
+                    if show_charts:
+                        st.markdown('<h2 class="sub-header">🔍 详细分析</h2>', unsafe_allow_html=True)
+                        
+                        # 创建标签页
+                        tabs = st.tabs([f"{r['symbol']} {r.get('name', '')}" for r in results])
+                        
+                        for idx, (tab, result) in enumerate(zip(tabs, results)):
+                            with tab:
+                                if result['analysis']:
+                                    col1, col2 = st.columns([2, 1])
+                                    
+                                    with col1:
+                                        # 竞价图表
+                                        fig = create_auction_chart(
+                                            result['akshare_data'], 
+                                            result.get('name', '')
+                                        )
+                                        if fig:
+                                            st.plotly_chart(fig, use_container_width=True)
+                                    
+                                    with col2:
+                                        # 关键信息卡片
+                                        st.markdown("### 📋 关键信息")
+                                        
+                                        rec = result['analysis']['recommendation']
+                                        st.markdown(f"""
+                                        <div style="background-color: #f0f2f6; padding: 15px; border-radius: 10px; margin-bottom: 15px;">
+                                            <h3 style="color: #1E88E5;">交易建议</h3>
+                                            <h2 class="{rec['class']}" style="font-size: 2rem;">{rec['desc']}</h2>
+                                            <p>置信度: {rec['confidence']}</p>
+                                        </div>
+                                        """, unsafe_allow_html=True)
+                                        
+                                        # 竞价信号
+                                        st.markdown("### 📈 竞价信号")
+                                        signals = result['analysis']['signals']
+                                        
+                                        signal_data = {
+                                            '指标': ['价格趋势', '成交量', '波动率'],
+                                            '数值': [
+                                                f"{signals['price_trend']['trend_pct']:+.2f}%",
+                                                f"{signals['volume']['total_volume']:,}手",
+                                                f"{signals['volatility']['volatility_pct']:.2f}%"
+                                            ],
+                                            '状态': [
+                                                signals['price_trend']['desc'],
+                                                signals['volume']['desc'],
+                                                signals['volatility']['desc']
+                                            ]
+                                        }
+                                        st.dataframe(pd.DataFrame(signal_data), hide_index=True, use_container_width=True)
+                                        
+                                        # 技术指标详情
+                                        if use_technical and result.get('baostock_data'):
+                                            st.markdown("### 📊 技术指标")
+                                            display_technical_details(result['baostock_data'])
+                                        
+                                        # 导出数据
+                                        with st.expander("查看原始数据"):
+                                            st.dataframe(result['akshare_data']['raw_data'])
+                    
+                    # 导出功能
+                    st.markdown("---")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        # 导出为CSV
+                        csv = df_display.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="📥 下载分析结果 (CSV)",
+                            data=csv,
+                            file_name=f"auction_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+                    
+                    with col2:
+                        # 导出为JSON
+                        json_str = json.dumps(
+                            [{'symbol': r['symbol'], 'name': r.get('name', ''), 
+                              'recommendation': r['analysis']['recommendation']['desc'],
+                              'trend': r['akshare_data']['trend_pct']} 
+                             for r in results if r['analysis']],
+                            ensure_ascii=False, indent=2
+                        )
+                        st.download_button(
+                            label="📥 下载摘要 (JSON)",
+                            data=json_str.encode('utf-8'),
+                            file_name=f"auction_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                            mime="application/json",
+                            use_container_width=True
+                        )
+                    
+                    with col3:
+                        # 刷新按钮
+                        if st.button("🔄 刷新数据", use_container_width=True):
+                            st.cache_data.clear()
+                            st.rerun()
             
-            # 显示数据表格
-            df_display = display_stock_table(results)
-            
-            if df_display is not None:
-                # 统计信息
-                st.markdown('<h2 class="sub-header">📊 统计概览</h2>', unsafe_allow_html=True)
-                
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    buy_count = len(df_display[df_display['交易建议'] == '买入'])
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <h3>买入建议</h3>
-                        <h2 class="signal-buy">{buy_count}</h2>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with col2:
-                    sell_count = len(df_display[df_display['交易建议'] == '卖出'])
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <h3>卖出建议</h3>
-                        <h2 class="signal-sell">{sell_count}</h2>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with col3:
-                    hold_count = len(df_display[df_display['交易建议'] == '持有'])
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <h3>持有建议</h3>
-                        <h2 class="signal-hold">{hold_count}</h2>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with col4:
-                    avg_score = pd.to_numeric(df_display['技术评分'].replace('N/A', np.nan)).mean()
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <h3>平均技术评分</h3>
-                        <h2>{avg_score:.3f}</h2>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                # 详细分析标签页
-                st.markdown('<h2 class="sub-header">🔍 详细分析</h2>', unsafe_allow_html=True)
-                
-                tabs = st.tabs([f"{r['symbol']}" for r in results])
-                
-                for idx, (tab, result) in enumerate(zip(tabs, results)):
-                    with tab:
-                        if result['analysis']:
-                            col1, col2 = st.columns([2, 1])
-                            
-                            with col1:
-                                # 竞价图表
-                                fig = create_auction_chart(result['akshare_data'])
-                                if fig:
-                                    st.plotly_chart(fig, use_container_width=True)
-                            
-                            with col2:
-                                # 关键信息卡片
-                                st.markdown("### 📋 关键信息")
-                                
-                                rec = result['analysis']['recommendation']
-                                st.markdown(f"""
-                                <div style="background-color: #f0f2f6; padding: 15px; border-radius: 10px;">
-                                    <h3 style="color: #1E88E5;">交易建议</h3>
-                                    <h2 class="{rec['class']}" style="font-size: 2rem;">{rec['desc']}</h2>
-                                    <p>置信度: {rec['confidence']}</p>
-                                </div>
-                                """, unsafe_allow_html=True)
-                                
-                                st.markdown("### 📊 技术指标详情")
-                                if result.get('baostock_data'):
-                                    display_technical_details(result['baostock_data'])
-                                
-                                st.markdown("### 📈 竞价信号")
-                                signals = result['analysis']['signals']
-                                for key, value in signals.items():
-                                    if key != 'volatility' or 'desc' in value:
-                                        st.write(f"**{key.replace('_', ' ').title()}**: {value.get('desc', 'N/A')}")
-                            
-                            # 原始数据
-                            with st.expander("查看原始数据"):
-                                st.dataframe(result['akshare_data']['raw_data'])
+            else:
+                st.warning("没有获取到任何有效数据")
         
         # 登出BaoStock
         analyzer.logout_baostock()
@@ -790,43 +1043,45 @@ def main():
     else:
         # 欢迎界面
         st.markdown("""
-        <div style="text-align: center; padding: 50px;">
-            <h2>👈 请在侧边栏配置分析参数</h2>
-            <p class="info-text">选择要分析的股票，点击"开始分析"按钮获取数据</p>
+        <div style="text-align: center; padding: 30px;">
+            <h2>👈 请在侧边栏选择要分析的股票</h2>
+            <p class="info-text">支持按板块筛选、搜索个股、查看热门股票或自定义列表</p>
         </div>
         """, unsafe_allow_html=True)
         
-        # 功能介绍
-        st.markdown('<h2 class="sub-header">✨ 功能介绍</h2>', unsafe_allow_html=True)
-        
+        # 显示市场概览
         col1, col2, col3 = st.columns(3)
         
-        with col1:
-            st.markdown("""
-            ### 🎯 集合竞价分析
-            - 实时获取9:15-9:25竞价数据
-            - 价格趋势识别
-            - 成交量分析
-            - 波动率评估
-            """)
+        all_stocks = get_all_stock_list()
         
-        with col2:
-            st.markdown("""
-            ### 📊 技术指标系统
-            - 均线系统分析
-            - RSI指标计算
-            - 成交量比率
-            - 综合技术评分
-            """)
-        
-        with col3:
-            st.markdown("""
-            ### 💡 智能交易建议
-            - 多信号综合判断
-            - 置信度评估
-            - 买入/卖出/持有建议
-            - 实时风险提示
-            """)
+        if not all_stocks.empty:
+            with col1:
+                sh_count = len(all_stocks[all_stocks['code'].str.startswith('6')])
+                st.markdown(f"""
+                <div class="metric-card">
+                    <h3>上证主板</h3>
+                    <h2>{sh_count}</h2>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with col2:
+                sz_count = len(all_stocks[all_stocks['code'].str.startswith('00')])
+                cyb_count = len(all_stocks[all_stocks['code'].str.startswith('30')])
+                st.markdown(f"""
+                <div class="metric-card">
+                    <h3>深证主板/创业板</h3>
+                    <h2>{sz_count} / {cyb_count}</h2>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with col3:
+                kcb_count = len(all_stocks[all_stocks['code'].str.startswith('688')])
+                st.markdown(f"""
+                <div class="metric-card">
+                    <h3>科创板</h3>
+                    <h2>{kcb_count}</h2>
+                </div>
+                """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
