@@ -114,9 +114,66 @@ class DailyReportGenerator:
         
         return True
     
+    def get_stock_list_from_akshare(self, date=None) -> pd.DataFrame:
+        """
+        使用akshare获取A股股票列表
+        """
+        try:
+            if date is None:
+                date = self.analysis_date
+            
+            # 获取所有A股股票列表
+            stock_info = ak.stock_info_a_code_name()
+            
+            # 转换股票代码格式以匹配baostock的格式
+            stock_list = []
+            for _, row in stock_info.iterrows():
+                code = row['code']
+                name = row['name']
+                
+                # 转换代码格式为 baostock 兼容格式
+                if code.startswith('6'):
+                    bs_code = f"sh.{code}"
+                elif code.startswith('0') or code.startswith('3') or code.startswith('2'):
+                    bs_code = f"sz.{code}"
+                else:
+                    bs_code = code
+                
+                stock_list.append({
+                    'code': bs_code,
+                    'code_name': name,
+                    'status': '1'  # 假设所有股票都是正常交易状态
+                })
+            
+            df = pd.DataFrame(stock_list)
+            
+            # 过滤掉B股、北交所等
+            df = df[
+                ~df['code'].str.contains('.200') &  # 深圳B股
+                ~df['code'].str.contains('.900') &  # 上海B股
+                ~df['code'].str.contains('.8') &    # 北交所/三板
+                ~df['code'].str.contains('.4')       # 老三板
+            ]
+            
+            return df
+            
+        except Exception as e:
+            st.error(f"获取股票列表失败: {e}")
+            # 返回一个小的示例列表作为备选
+            return pd.DataFrame([
+                {'code': 'sh.600000', 'code_name': '浦发银行', 'status': '1'},
+                {'code': 'sh.600004', 'code_name': '白云机场', 'status': '1'},
+                {'code': 'sh.600009', 'code_name': '上海机场', 'status': '1'},
+                {'code': 'sz.000001', 'code_name': '平安银行', 'status': '1'},
+                {'code': 'sz.000002', 'code_name': '万科A', 'status': '1'},
+                {'code': 'sz.000333', 'code_name': '美的集团', 'status': '1'},
+                {'code': 'sz.002142', 'code_name': '宁波银行', 'status': '1'},
+                {'code': 'sz.300059', 'code_name': '东方财富', 'status': '1'}
+            ])
+    
     def get_stock_data_for_date(self, symbol: str, target_date: datetime, days: int = 60) -> pd.DataFrame:
         """
-        获取指定日期附近的股票数据
+        获取指定日期附近的股票数据（仍使用baostock，因为akshare历史数据获取可能更复杂）
         Args:
             symbol: 股票代码
             target_date: 目标日期
@@ -155,25 +212,52 @@ class DailyReportGenerator:
     def get_auction_data_for_date(self, symbol: str, target_date: datetime) -> dict:
         """
         获取指定日期的竞价数据
-        注意：AKShare可能无法获取历史竞价数据，这里使用模拟或备选方案
+        使用akshare获取实时或历史分时数据
         """
         try:
-            # 尝试获取历史竞价数据
-            # 注意：AKShare的盘前数据接口可能不支持历史数据
-            # 这里使用一个模拟方案，实际使用时需要根据数据源调整
+            # 转换代码格式为akshare格式（去掉前缀）
+            ak_code = symbol.replace('sh.', '').replace('sz.', '')
             
-            # 方案1：如果是当前日期，尝试获取实时数据
+            # 如果是当前日期，尝试获取实时数据
             if target_date.date() == datetime.now().date():
-                pre_market_df = ak.stock_zh_a_hist_pre_min_em(
-                    symbol=symbol,
+                try:
+                    # 获取当日分时数据
+                    intraday = ak.stock_zh_a_tick_tx(ak_code, trade_date=target_date.strftime('%Y%m%d'))
+                    
+                    if not intraday.empty:
+                        # 筛选竞价时间（9:15-9:25）
+                        intraday['时间'] = pd.to_datetime(intraday['时间']).dt.time
+                        auction_data = intraday[
+                            (intraday['时间'] >= pd.to_datetime('09:15').time()) & 
+                            (intraday['时间'] <= pd.to_datetime('09:25').time())
+                        ]
+                        
+                        if not auction_data.empty:
+                            final_price = float(auction_data.iloc[-1]['成交价'])
+                            total_volume = auction_data['成交量'].sum()
+                            
+                            return {
+                                'final_price': final_price,
+                                'total_volume': total_volume,
+                                'data_points': len(auction_data),
+                                'status': 'success'
+                            }
+                except:
+                    pass
+            
+            # 尝试获取历史分时数据
+            try:
+                # 获取历史分时数据（可能需要特殊处理）
+                hist_data = ak.stock_zh_a_hist_pre_min_em(
+                    symbol=ak_code,
                     start_time="09:00:00",
                     end_time="09:30:00"
                 )
                 
-                if not pre_market_df.empty:
+                if not hist_data.empty:
                     # 筛选竞价时间
-                    auction_df = pre_market_df[
-                        pre_market_df['时间'].str.contains('09:1[5-9]|09:2[0-5]')
+                    auction_df = hist_data[
+                        hist_data['时间'].str.contains('09:1[5-9]|09:2[0-5]')
                     ]
                     
                     if not auction_df.empty:
@@ -186,8 +270,10 @@ class DailyReportGenerator:
                             'data_points': len(auction_df),
                             'status': 'success'
                         }
+            except:
+                pass
             
-            # 方案2：使用历史日线数据估算竞价情况
+            # 方案3：使用历史日线数据估算竞价情况
             historical_data = self.get_stock_data_for_date(symbol, target_date, 5)
             if not historical_data.empty and len(historical_data) >= 2:
                 # 使用前一日收盘价作为竞价基准
@@ -441,21 +527,29 @@ class DailyReportGenerator:
             return "竞价信号一般，建议观望"
     
     def get_trading_dates(self, year: int) -> list:
-        """获取指定年份的交易日列表"""
+        """获取指定年份的交易日列表（使用akshare）"""
         try:
-            lg = bs.login()
-            rs = bs.query_trade_dates(start_date=f"{year}-01-01", end_date=f"{year}-12-31")
-            data = rs.get_data()
-            bs.logout()
+            # 使用akshare获取交易日历
+            calendar = ak.tool_trade_date_hist_sina()
+            # 过滤指定年份的交易日
+            year_dates = calendar[
+                (pd.to_datetime(calendar['trade_date']).dt.year == year) &
+                (calendar['is_open'] == 1)
+            ]['trade_date'].tolist()
             
-            if not data.empty:
-                trading_dates = data[data['is_trading_day'] == '1']['calendar_date'].tolist()
-                return trading_dates
-        except:
-            pass
-        
-        # 如果获取失败，返回空列表
-        return []
+            return [date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else date for date in year_dates]
+        except Exception as e:
+            st.warning(f"获取交易日历失败: {e}")
+            # 返回一个简单的备选列表（仅限工作日）
+            dates = []
+            start_date = datetime(year, 1, 1)
+            end_date = datetime(year, 12, 31)
+            current_date = start_date
+            while current_date <= end_date:
+                if current_date.weekday() < 5:  # 周一到周五
+                    dates.append(current_date.strftime('%Y-%m-%d'))
+                current_date += timedelta(days=1)
+            return dates
     
     def generate_daily_report(self) -> dict:
         """生成每日报告"""
@@ -465,21 +559,22 @@ class DailyReportGenerator:
             st.warning(f"📅 {self.analysis_date.strftime('%Y-%m-%d')} 非交易日，跳过报告生成")
             return {}
         
-        # 连接数据源
+        # 连接数据源 (baostock仍用于历史数据)
         lg = bs.login()
         st.info(f"📊 BaoStock连接: {lg.error_code}")
         
         try:
-            # 获取股票列表
-            st.info("🔍 获取股票列表...")
-            stock_rs = bs.query_all_stock(day=self.analysis_date.strftime('%Y-%m-%d'))
-            all_stocks = stock_rs.get_data()
+            # 使用akshare获取股票列表
+            st.info("🔍 使用akshare获取股票列表...")
+            all_stocks = self.get_stock_list_from_akshare()
             
             if all_stocks.empty:
                 st.error("❌ 无法获取股票列表")
                 return {}
             
-            # 快速采样分析 (限制数量以提高速度)
+            st.info(f"📋 获取到 {len(all_stocks)} 只A股")
+            
+            # 按市场分类
             markets = {
                 '上海主板': all_stocks[all_stocks['code'].str.startswith('sh.6') & ~all_stocks['code'].str.startswith('sh.688')],
                 '科创板': all_stocks[all_stocks['code'].str.startswith('sh.688')],
@@ -488,15 +583,23 @@ class DailyReportGenerator:
                 '创业板': all_stocks[all_stocks['code'].str.startswith('sz.30')]
             }
             
+            # 显示各市场股票数量
+            market_counts = {name: len(df) for name, df in markets.items()}
+            st.info(f"📊 市场分布: {market_counts}")
+            
+            # 采样分析 (限制数量以提高速度)
             sample_stocks = []
+            sample_size_per_market = min(30, 500 // len(markets))  # 每个市场采样约30只，总样本约150只
+            
             for market_name, market_stocks in markets.items():
                 if len(market_stocks) > 0:
-                    sample_size = min(20, len(market_stocks))  # 每个市场采样20只
+                    sample_size = min(sample_size_per_market, len(market_stocks))
                     sampled = market_stocks.sample(n=sample_size, random_state=42)
                     sample_stocks.append(sampled)
+                    st.info(f"  {market_name}: 采样 {sample_size} 只")
             
             final_sample = pd.concat(sample_stocks, ignore_index=True)
-            st.info(f"📋 快速分析样本: {len(final_sample)}只股票")
+            st.info(f"📋 最终分析样本: {len(final_sample)}只股票")
             
             # 执行分析
             progress_bar = st.progress(0)
@@ -529,7 +632,7 @@ class DailyReportGenerator:
                         auction_stats['gap_down_count'] += 1
                 
                 progress_bar.progress((idx + 1) / len(final_sample))
-                time.sleep(0.1)  # 稍微延迟，避免请求过快
+                time.sleep(0.05)  # 稍微延迟，避免请求过快
             
             progress_bar.empty()
             status_text.empty()
@@ -548,11 +651,12 @@ class DailyReportGenerator:
             report_data = {
                 'date': self.analysis_date.strftime('%Y-%m-%d'),
                 'analysis_time': datetime.now().strftime('%H:%M:%S'),
-                'recommendations': recommendations[:20],  # 限制推荐数量为前20只
+                'recommendations': recommendations[:30],  # 限制推荐数量为前30只
                 'market_summary': {
                     'total_analyzed': len(final_sample),
                     'total_recommended': len(recommendations),
-                    'avg_score': round(avg_score, 3)
+                    'avg_score': round(avg_score, 3),
+                    'market_distribution': market_counts
                 },
                 'auction_analysis': {
                     'avg_auction_ratio': round(avg_auction_ratio, 2),
@@ -584,6 +688,8 @@ class DailyReportGenerator:
             
         except Exception as e:
             st.error(f"❌ 报告生成失败: {e}")
+            import traceback
+            st.error(traceback.format_exc())
             return {}
         
         finally:
@@ -627,6 +733,15 @@ def display_dashboard(report_data):
         st.metric("平均评分", f"{market_summary.get('avg_score', 0):.3f}")
     with col4:
         st.metric("平均竞价涨幅", f"{auction_analysis.get('avg_auction_ratio', 0):.2f}%")
+    
+    # 市场分布
+    market_dist = market_summary.get('market_distribution', {})
+    if market_dist:
+        st.markdown("##### 市场分布")
+        cols = st.columns(len(market_dist))
+        for i, (market, count) in enumerate(market_dist.items()):
+            with cols[i]:
+                st.metric(market, count)
     
     # 竞价分析图表
     col1, col2 = st.columns(2)
@@ -884,6 +999,8 @@ def main():
             - 每个交易日9:25-9:29自动分析
             - 结合竞价数据和技术指标
             - 智能评分和策略建议
+            - 使用AKShare获取股票列表
+            - 使用BaoStock获取历史K线数据
             """)
     
     # 主内容区域
@@ -1027,9 +1144,16 @@ def quick_test_report(analysis_date=None):
             }
         ],
         'market_summary': {
-            'total_analyzed': 80,
+            'total_analyzed': 150,
             'total_recommended': 4,
-            'avg_score': 0.815
+            'avg_score': 0.815,
+            'market_distribution': {
+                '上海主板': 50,
+                '科创板': 20,
+                '深圳主板': 30,
+                '中小板': 30,
+                '创业板': 20
+            }
         },
         'auction_analysis': {
             'avg_auction_ratio': 0.7,
