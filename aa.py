@@ -642,7 +642,8 @@ class AuctionDataAnalyzer:
     
     def _save_results(self, results):
         """保存分析结果"""
-        filename = f"/Users/yang/auction_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        # 使用当前工作目录，而不是硬编码的路径
+        filename = f"auction_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         
         # 转换为可序列化的格式
         serializable_results = []
@@ -660,7 +661,7 @@ class AuctionDataAnalyzer:
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(serializable_results, f, ensure_ascii=False, indent=2)
         
-        print(f"\n💾 分析结果已保存到: {filename}")
+        print(f"\n💾 分析结果已保存到当前目录: {os.path.abspath(filename)}")
     
     def _generate_summary_report(self, results):
         """生成总结报告"""
